@@ -1,0 +1,1 @@
+# cardmirror-collapsible-headers
