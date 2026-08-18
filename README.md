@@ -5,4 +5,4 @@ It's pretty self-explanatory: Collapsible Headers allows debaters to collapse an
 
 ## Current Features
 - Clicking the dropdowns to the left of Pocket, Hat, and Block styles collapse its contents. Press again to expand.
-- "Collapse All" and "Expand All" commands are available in CardMirror's Search feature
+- "Collapse All" and "Expand All" commands are available in CardMirror's Search feature.
