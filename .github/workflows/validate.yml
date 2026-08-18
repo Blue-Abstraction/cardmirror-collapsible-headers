@@ -1,0 +1,42 @@
+name: Validate plugin
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check JavaScript syntax
+        run: node --check plugin.js
+      - name: Validate manifest
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const manifest = JSON.parse(fs.readFileSync('cardmirror-plugin.json', 'utf8'));
+          const required = ['id', 'name', 'version', 'apiVersion'];
+          for (const key of required) {
+            if (manifest[key] === undefined || manifest[key] === '') {
+              throw new Error(`Missing required manifest field: ${key}`);
+            }
+          }
+          if (!/^[a-z0-9][a-z0-9-]*$/.test(manifest.id)) {
+            throw new Error('Invalid plugin id');
+          }
+          if (manifest.apiVersion !== 1) {
+            throw new Error('apiVersion must be 1');
+          }
+          if ('repo' in manifest) {
+            throw new Error('Do not put repo in the release manifest');
+          }
+          const source = fs.readFileSync('plugin.js', 'utf8');
+          if (!source.includes(`const PLUGIN_ID = '${manifest.id}'`)) {
+            throw new Error('plugin.js PLUGIN_ID must match manifest id');
+          }
+          console.log(`Validated ${manifest.name} ${manifest.version}`);
+          NODE
