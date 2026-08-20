@@ -38,5 +38,10 @@ jobs:
           if (!source.includes(`const PLUGIN_ID = '${manifest.id}'`)) {
             throw new Error('plugin.js PLUGIN_ID must match manifest id');
           }
+          for (const setting of ['triangleColor', 'triangleSize']) {
+            if (!source.includes(`key: '${setting}'`)) {
+              throw new Error(`Missing declared setting: ${setting}`);
+            }
+          }
           console.log(`Validated ${manifest.name} ${manifest.version}`);
           NODE
