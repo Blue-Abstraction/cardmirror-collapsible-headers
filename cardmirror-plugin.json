@@ -1,7 +1,7 @@
 {
   "id": "cardmirror-collapsible-headers",
   "name": "Collapsible Headers",
-  "version": "1.0.0-beta.6",
+  "version": "1.1.0",
   "description": "Collapse and expand Pocket, Hat, and Block sections directly in the document.",
   "author": "Evan Xiang",
   "apiVersion": 1,

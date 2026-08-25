@@ -72,7 +72,10 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
     'Pink',
     'Gray',
   ];
-  const SIZE_OPTIONS = ['Small', 'Medium', 'Large'];
+  const TRIANGLE_SIZE_MIN = 6;
+  const TRIANGLE_SIZE_MAX = 16;
+  const TRIANGLE_SIZE_DEFAULT = 8;
+  const DRAG_HIDDEN_ATTR = 'data-cm-ch-drag-hidden';
 
   const COLOR_CSS = {
     Red: 'color-mix(in srgb, #ef4444 78%, var(--pmd-c-text, currentColor))',
@@ -85,15 +88,9 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
     Gray: 'color-mix(in srgb, #6b7280 72%, var(--pmd-c-text, currentColor))',
   };
 
-  const SIZE_METRICS = {
-    Small: { hit: 13, glyph: 7, gap: 2 },
-    Medium: { hit: 15, glyph: 8, gap: 2 },
-    Large: { hit: 20, glyph: 12, gap: 3 },
-  };
-
   let appearance = {
     color: 'Automatic',
-    size: 'Medium',
+    size: TRIANGLE_SIZE_DEFAULT,
   };
 
   let pluginApi = null;
@@ -116,6 +113,8 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
   let nextRootToken = 1;
   let collapseStyle = null;
   let cssQueued = false;
+  let collapseAllRequested = false;
+  const pendingCollapseRoots = new Set();
   let layoutQueued = false;
   let layoutAllRequested = false;
   const pendingLayoutRoots = new Set();
@@ -123,6 +122,25 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
   let structureQueued = false;
   const pendingStructureRoots = new Set();
   const pendingPostEditRoots = new Set();
+
+  const RIGHT_DRAG_THRESHOLD_PX = 6;
+  let pendingTriangleRightDrag = null;
+  let triangleDragProxyActive = false;
+  let triangleDragProxyRoot = null;
+  let triangleDragSourceId = '';
+  let triangleDragSourceLevel = null;
+  let triangleDragLastPointer = null;
+  let triangleDragCancelled = false;
+  let triangleDragPhysicalButtonMask = 0;
+  let triangleDragSuppressContextUntil = 0;
+  let triangleDragSettlingRoot = null;
+  let triangleDragViewportSnapshot = null;
+  let dragMaskRefreshQueued = false;
+  let reorderIndicator = null;
+  let reorderAutoScrollRaf = 0;
+  let reorderAutoScrollVelocity = 0;
+  const proxiedDragEvents = new WeakSet();
+  let themeObserver = null;
 
   function headingLevel(el) {
     if (!(el instanceof HTMLElement)) return null;
@@ -192,6 +210,54 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
           outline: 1px solid currentColor;
           outline-offset: 1px;
         }
+
+        .cm-collapse-toggle.cm-ch-dragging {
+          opacity: 1;
+          cursor: grabbing;
+          background: color-mix(in srgb, currentColor 16%, transparent);
+        }
+
+        .cm-ch-reorder-indicator {
+          position: fixed;
+          height: 2px;
+          border-radius: 999px;
+          background: currentColor;
+          opacity: .72;
+          pointer-events: none;
+          z-index: 2147483000;
+          box-shadow: 0 0 0 1px color-mix(in srgb, currentColor 12%, transparent);
+        }
+
+        .ProseMirror > [${DRAG_HIDDEN_ATTR}] {
+          display: none !important;
+        }
+
+        .cm-ch-size-stepper {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+        }
+
+        .cm-ch-size-stepper > button {
+          min-width: 26px;
+          height: 26px;
+          padding: 0 6px;
+          border-radius: 5px;
+          line-height: 1;
+        }
+
+        .cm-ch-size-stepper > input[type="number"] {
+          width: 52px !important;
+          text-align: center;
+          appearance: textfield;
+          -moz-appearance: textfield;
+        }
+
+        .cm-ch-size-stepper > input[type="number"]::-webkit-inner-spin-button,
+        .cm-ch-size-stepper > input[type="number"]::-webkit-outer-spin-button {
+          -webkit-appearance: none;
+          margin: 0;
+        }
       `;
       document.head.appendChild(style);
     }
@@ -204,12 +270,36 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
     }
   }
 
+  function ensureThemeObserver() {
+    if (themeObserver || typeof MutationObserver !== 'function') return;
+    const targets = [document.documentElement, document.body].filter(Boolean);
+    if (!targets.length) return;
+
+    themeObserver = new MutationObserver(() => {
+      if (destroyed || appearance.color !== 'Automatic') return;
+      updateAllButtonAppearance();
+    });
+    for (const target of targets) {
+      try {
+        themeObserver.observe(target, {
+          attributes: true,
+          attributeFilter: ['class', 'style', 'data-theme'],
+        });
+      } catch (_) {}
+    }
+  }
+
   function validColor(value) {
     return COLOR_OPTIONS.includes(value) ? value : 'Automatic';
   }
 
   function validSize(value) {
-    return SIZE_OPTIONS.includes(value) ? value : 'Medium';
+    if (value === 'Small') return 7;
+    if (value === 'Medium') return 8;
+    if (value === 'Large') return 12;
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return TRIANGLE_SIZE_DEFAULT;
+    return Math.max(TRIANGLE_SIZE_MIN, Math.min(TRIANGLE_SIZE_MAX, Math.round(numeric)));
   }
 
   function bootstrapSettingsBag() {
@@ -276,14 +366,14 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
         if (key === 'triangleColor') {
           setAppearance(String(value), appearance.size);
         } else if (key === 'triangleSize') {
-          setAppearance(appearance.color, String(value));
+          setAppearance(appearance.color, value);
         }
       });
     }
 
     setAppearance(
       String(api.settings.get('triangleColor') ?? 'Automatic'),
-      String(api.settings.get('triangleSize') ?? 'Medium')
+      api.settings.get('triangleSize') ?? TRIANGLE_SIZE_DEFAULT
     );
   }
 
@@ -297,12 +387,96 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
      * this job and this listener becomes a no-op.
      */
     if (pluginApi) return;
-    if (!(event.target instanceof HTMLSelectElement)) return;
-    requestAnimationFrame(syncAppearanceFromBootstrap);
+    if (!(event.target instanceof HTMLSelectElement) &&
+        !(event.target instanceof HTMLInputElement)) return;
+    requestAnimationFrame(() => {
+      syncAppearanceFromBootstrap();
+      enhanceTriangleSizeSetting();
+    });
   }
 
   function sizeMetrics() {
-    return SIZE_METRICS[appearance.size] || SIZE_METRICS.Medium;
+    const glyph = validSize(appearance.size);
+    return {
+      glyph,
+      hit: Math.max(12, Math.round(glyph * 1.5 + 3)),
+      gap: glyph >= 11 ? 3 : 2,
+    };
+  }
+
+  function setNativeNumberInputValue(input, value) {
+    if (!(input instanceof HTMLInputElement)) return;
+    const next = String(validSize(value));
+    if (input.value === next) return;
+    input.value = next;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function enhanceTriangleSizeSetting() {
+    if (destroyed) return;
+    const inputs = document.querySelectorAll('input[type="number"]');
+    for (const input of inputs) {
+      if (!(input instanceof HTMLInputElement) || input.dataset.cmChSizeEnhanced === '1') continue;
+      let container = input.parentElement;
+      let depth = 0;
+      while (container && depth < 5 && !/Triangle size/i.test(container.textContent || '')) {
+        container = container.parentElement;
+        depth += 1;
+      }
+      if (!(container instanceof HTMLElement) || !/Triangle size/i.test(container.textContent || '')) continue;
+
+      input.dataset.cmChSizeEnhanced = '1';
+      input.min = String(TRIANGLE_SIZE_MIN);
+      input.max = String(TRIANGLE_SIZE_MAX);
+      input.step = '1';
+      const bounded = validSize(input.value || TRIANGLE_SIZE_DEFAULT);
+      if (String(bounded) !== input.value) setNativeNumberInputValue(input, bounded);
+
+      const parent = input.parentElement;
+      if (!(parent instanceof HTMLElement)) continue;
+      const wrapper = document.createElement('span');
+      wrapper.className = 'cm-ch-size-stepper';
+      parent.insertBefore(wrapper, input);
+      wrapper.appendChild(input);
+
+      const down = document.createElement('button');
+      down.type = 'button';
+      down.textContent = '▼';
+      down.title = `Decrease triangle size (minimum ${TRIANGLE_SIZE_MIN})`;
+      down.setAttribute('aria-label', down.title);
+
+      const up = document.createElement('button');
+      up.type = 'button';
+      up.textContent = '▲';
+      up.title = `Increase triangle size (maximum ${TRIANGLE_SIZE_MAX})`;
+      up.setAttribute('aria-label', up.title);
+
+      down.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        setNativeNumberInputValue(input, Number(input.value) - 1);
+      });
+      up.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        setNativeNumberInputValue(input, Number(input.value) + 1);
+      });
+      input.addEventListener('change', () => {
+        const clamped = validSize(input.value);
+        if (String(clamped) !== input.value) setNativeNumberInputValue(input, clamped);
+      });
+
+      wrapper.insertBefore(down, input);
+      wrapper.appendChild(up);
+    }
+  }
+
+  function queueEnhanceTriangleSizeSetting() {
+    requestAnimationFrame(() => {
+      enhanceTriangleSizeSetting();
+      requestAnimationFrame(enhanceTriangleSizeSetting);
+    });
   }
 
   function applyButtonAppearance(heading, btn) {
@@ -358,6 +532,10 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
     if (info) {
       try { info.intersection?.disconnect(); } catch (_) {}
       try { info.mutations?.disconnect(); } catch (_) {}
+      for (const observer of info.headingMutationObservers?.values?.() || []) {
+        try { observer.disconnect(); } catch (_) {}
+      }
+      info.headingMutationObservers?.clear?.();
       try { info.resize?.disconnect(); } catch (_) {}
       info.layer?.remove();
     }
@@ -391,9 +569,15 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
 
         if (entry.isIntersecting && entry.intersectionRect.width > 0 && entry.intersectionRect.height > 0) {
           visibleHeadings.add(heading);
+          const current = roots.get(root);
+          try { current?.resize?.observe(heading); } catch (_) {}
+          try { current?.observeHeadingMutations?.(heading); } catch (_) {}
           ensureButton(heading);
         } else {
           visibleHeadings.delete(heading);
+          const current = roots.get(root);
+          try { current?.resize?.unobserve(heading); } catch (_) {}
+          try { current?.unobserveHeadingMutations?.(heading); } catch (_) {}
           removeButton(heading);
         }
       }
@@ -408,10 +592,61 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
     // replacement). Ordinary text typing does NOT fire this observer.
     const mutations = new MutationObserver(records => {
       if (records.some(record => record.type === 'childList')) {
-        queueStructureRefresh(root);
+        const current = roots.get(root);
+        if (current) current.structureDirty = true;
+        // CardMirror can make several transient top-level DOM changes while its
+        // a triangle reorder sequence is active. Rebuilding our entire heading index
+        // between individual native Move Container transactions is wasted work.
+        // Coalesce it to the final settled structure instead.
+        if ((triangleDragProxyActive && triangleDragProxyRoot === root) ||
+            triangleDragSettlingRoot === root) {
+          // Reorder is committed as a short sequence of native Move Container
+          // operations. The intermediate structures are never useful to us;
+          // rebuild once after the sequence completes.
+        } else {
+          queueStructureRefresh(root);
+        }
       }
     });
     mutations.observe(root, { childList: true });
+
+    // Heading-only style/inline-structure changes (font size, bold wrappers,
+    // etc.) can move the first glyph without resizing the editor root. Track
+    // ONLY headings near the viewport. Attaching an observer to every heading
+    // in a tournament master file made first-open/navigation unnecessarily
+    // expensive even though offscreen headings cannot currently be edited.
+    const headingMutationObservers = new Map();
+
+    const observeHeadingMutations = heading => {
+      if (!(heading instanceof HTMLElement) || headingMutationObservers.has(heading)) return;
+      const observer = new MutationObserver(records => {
+        if (triangleDragProxyActive && triangleDragProxyRoot === root) return;
+
+        if (appearance.color === 'Automatic') {
+          const btn = buttons.get(heading);
+          if (btn) applyButtonAppearance(heading, btn);
+        }
+        queueLayout(root);
+      });
+      try {
+        observer.observe(heading, {
+          subtree: true,
+          childList: true,
+          attributes: true,
+          attributeFilter: ['class', 'style'],
+        });
+        headingMutationObservers.set(heading, observer);
+      } catch (_) {
+        try { observer.disconnect(); } catch (_) {}
+      }
+    };
+
+    const unobserveHeadingMutations = heading => {
+      const observer = headingMutationObservers.get(heading);
+      if (!observer) return;
+      try { observer.disconnect(); } catch (_) {}
+      headingMutationObservers.delete(heading);
+    };
 
     /*
      * Text edits that add/remove wrapped lines change the editor's geometry
@@ -421,7 +656,10 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
      * triangle buttons.
      */
     const resize = typeof ResizeObserver === 'function'
-      ? new ResizeObserver(() => queueLayout(root))
+      ? new ResizeObserver(() => {
+          if (triangleDragProxyActive && triangleDragProxyRoot === root) return;
+          queueLayout(root);
+        })
       : null;
     try { resize?.observe(root); } catch (_) {}
 
@@ -432,8 +670,18 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
       layer,
       intersection,
       mutations,
+      headingMutationObservers,
+      observeHeadingMutations,
+      unobserveHeadingMutations,
       resize,
       headings: new Set(),
+      entries: [],
+      entryByHeading: new Map(),
+      entryById: new Map(),
+      entryIndexByHeading: new Map(),
+      collapseRulesText: '',
+      structureReady: false,
+      structureDirty: false,
     };
     roots.set(root, info);
     return info;
@@ -449,6 +697,10 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
       if (!root.isConnected) {
         try { info.intersection.disconnect(); } catch (_) {}
         try { info.mutations.disconnect(); } catch (_) {}
+        for (const observer of info.headingMutationObservers?.values?.() || []) {
+        try { observer.disconnect(); } catch (_) {}
+      }
+      info.headingMutationObservers?.clear?.();
         try { info.resize?.disconnect(); } catch (_) {}
         info.layer.remove();
         roots.delete(root);
@@ -456,18 +708,66 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
     }
   }
 
-  function headingsIn(root) {
-    return Array.from(root.querySelectorAll(HEADING_SELECTOR))
-      .filter(el => el instanceof HTMLElement && headingId(el));
+  function buildRootStructure(info) {
+    const entries = [];
+    const stack = [];
+    const children = info.root.children;
+    const ownerHeadingByChild = new WeakMap();
+    let nearestHeading = null;
+
+    for (let i = 0; i < children.length; i++) {
+      const child = children[i];
+      if (!(child instanceof HTMLElement)) continue;
+      const level = headingLevel(child);
+      const id = headingId(child);
+
+      if (level != null && id) {
+        while (stack.length && stack[stack.length - 1].level >= level) {
+          stack.pop().endIndexExclusive = i;
+        }
+
+        const entry = {
+          heading: child,
+          id,
+          level,
+          startIndex: i,
+          endIndexExclusive: children.length,
+          // The outline depth is at most three. Recording the path once makes
+          // auto-reveal/focus navigation O(depth) instead of walking backward
+          // through every preceding heading on large backfiles.
+          ancestorHeadings: stack.map(parent => parent.heading),
+        };
+        entries.push(entry);
+        stack.push(entry);
+        nearestHeading = child;
+      }
+
+      if (nearestHeading instanceof HTMLElement) {
+        ownerHeadingByChild.set(child, nearestHeading);
+      }
+    }
+
+    for (const entry of stack) entry.endIndexExclusive = children.length;
+    info.entries = entries;
+    info.ownerHeadingByChild = ownerHeadingByChild;
+    info.structureReady = true;
+    info.structureDirty = false;
+    info.entryByHeading = new Map(entries.map(entry => [entry.heading, entry]));
+    info.entryById = new Map(entries.map(entry => [entry.id, entry]));
+    info.entryIndexByHeading = new Map(entries.map((entry, index) => [entry.heading, index]));
+    return entries;
   }
 
   function syncRootHeadings(root) {
     const info = ensureLayerFor(root);
-    const next = new Set(headingsIn(root));
+    const entries = buildRootStructure(info);
+    const next = new Set(entries.map(entry => entry.heading));
 
     for (const oldHeading of info.headings) {
       if (!next.has(oldHeading)) {
         try { info.intersection.unobserve(oldHeading); } catch (_) {}
+        try { info.resize?.unobserve(oldHeading); } catch (_) {}
+        try { info.unobserveHeadingMutations?.(oldHeading); } catch (_) {}
         visibleHeadings.delete(oldHeading);
         removeButton(oldHeading);
       }
@@ -476,10 +776,14 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
     for (const heading of next) {
       if (!info.headings.has(heading)) {
         info.intersection.observe(heading);
+        // Per-heading resize tracking is enabled by IntersectionObserver only
+        // while the heading is near the viewport. Observing every heading on a
+        // giant backfile makes browser layout work scale with the whole file.
       }
     }
 
     info.headings = next;
+    queueCollapseCss(root);
   }
 
   function ensureRoot(root) {
@@ -487,7 +791,7 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
       return null;
     }
     const info = ensureLayerFor(root);
-    if (info.headings.size === 0) syncRootHeadings(root);
+    if (!info.structureReady || info.structureDirty) syncRootHeadings(root);
     return info;
   }
 
@@ -497,6 +801,471 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
     buttons.delete(heading);
   }
 
+  function isMacPlatform() {
+    const platform = navigator.userAgentData?.platform || navigator.platform || '';
+    return /Mac/i.test(platform);
+  }
+
+  function clearDragVisibilityMask(root) {
+    if (!(root instanceof HTMLElement)) return;
+    for (const child of root.children) {
+      if (child instanceof HTMLElement) child.removeAttribute(DRAG_HIDDEN_ATTR);
+    }
+  }
+
+  function refreshDragVisibilityMask(root) {
+    if (!(root instanceof HTMLElement) || !root.isConnected) return;
+    clearDragVisibilityMask(root);
+
+    const children = Array.from(root.children).filter(child => child instanceof HTMLElement);
+    const entries = [];
+    const stack = [];
+    for (let i = 0; i < children.length; i++) {
+      const child = children[i];
+      const level = headingLevel(child);
+      const id = headingId(child);
+      if (level == null || !id) continue;
+      while (stack.length && stack[stack.length - 1].level >= level) {
+        stack.pop().endIndexExclusive = i;
+      }
+      const entry = { id, level, startIndex: i, endIndexExclusive: children.length };
+      entries.push(entry);
+      stack.push(entry);
+    }
+    for (const entry of stack) entry.endIndexExclusive = children.length;
+
+    let hiddenUntil = -1;
+    for (const entry of entries) {
+      if (entry.startIndex < hiddenUntil || !collapsedIds.has(entry.id)) continue;
+      for (let i = entry.startIndex + 1; i < entry.endIndexExclusive; i++) {
+        children[i]?.setAttribute?.(DRAG_HIDDEN_ATTR, '');
+      }
+      hiddenUntil = entry.endIndexExclusive;
+    }
+  }
+
+  function queueDragVisibilityMask(root) {
+    if (dragMaskRefreshQueued) return;
+    dragMaskRefreshQueued = true;
+    queueMicrotask(() => {
+      dragMaskRefreshQueued = false;
+      if (root === triangleDragProxyRoot || root === triangleDragSettlingRoot) {
+        refreshDragVisibilityMask(root);
+      }
+    });
+  }
+
+  function captureViewportSnapshot(root) {
+    if (!(root instanceof HTMLElement)) return null;
+    const info = roots.get(root);
+    const scroller = info?.scrollParent || scrollParentFor(root);
+    if (!scroller || isWindowScroller(scroller)) {
+      return { root, windowScroll: true, x: window.scrollX, y: window.scrollY };
+    }
+    return {
+      root,
+      windowScroll: false,
+      scroller,
+      x: scroller.scrollLeft,
+      y: scroller.scrollTop,
+    };
+  }
+
+  function restoreViewportSnapshot(snapshot = triangleDragViewportSnapshot) {
+    if (!snapshot) return;
+    try {
+      if (snapshot.windowScroll) {
+        window.scrollTo(snapshot.x, snapshot.y);
+      } else if (snapshot.scroller?.isConnected) {
+        snapshot.scroller.scrollLeft = snapshot.x;
+        snapshot.scroller.scrollTop = snapshot.y;
+      }
+    } catch (_) {}
+  }
+
+  function finalizeTriangleDragSettling(root) {
+    if (!(root instanceof HTMLElement) || !root.isConnected) {
+      if (root instanceof HTMLElement) clearDragVisibilityMask(root);
+      triangleDragSettlingRoot = null;
+      triangleDragViewportSnapshot = null;
+      return;
+    }
+    const info = roots.get(root);
+    if (info) {
+      info.structureDirty = true;
+      syncRootHeadings(root);
+    } else {
+      queueCollapseCss(root);
+    }
+
+    requestAnimationFrame(() => {
+      restoreViewportSnapshot();
+      requestAnimationFrame(() => {
+        restoreViewportSnapshot();
+        clearDragVisibilityMask(root);
+        triangleDragSettlingRoot = null;
+        triangleDragViewportSnapshot = null;
+        queueLayout(root);
+      });
+    });
+  }
+
+  function sameLevelHeadings(root, level) {
+    if (!(root instanceof HTMLElement) || level == null) return [];
+    const info = ensureRoot(root);
+    if (!info) return [];
+    return info.entries
+      .filter(entry => entry.level === level && entry.heading?.isConnected)
+      .map(entry => entry.heading);
+  }
+
+  function clearReorderIndicator() {
+    try { reorderIndicator?.remove(); } catch (_) {}
+    reorderIndicator = null;
+  }
+
+  function ensureReorderIndicator() {
+    if (reorderIndicator?.isConnected) return reorderIndicator;
+    const line = document.createElement('div');
+    line.className = 'cm-ch-reorder-indicator';
+    document.body.appendChild(line);
+    reorderIndicator = line;
+    return line;
+  }
+
+  function reorderInsertionForPointer(root, source, level, pointerY) {
+    const peers = sameLevelHeadings(root, level);
+    const sourceIndex = peers.indexOf(source);
+    if (sourceIndex < 0) return null;
+    const others = peers.filter(heading => heading !== source);
+    let insertion = others.length;
+    for (let i = 0; i < others.length; i++) {
+      const rect = others[i].getBoundingClientRect();
+      if (pointerY < rect.top + rect.height / 2) {
+        insertion = i;
+        break;
+      }
+    }
+    return { peers, others, sourceIndex, desiredIndex: insertion };
+  }
+
+  function updateReorderIndicator(root, sourceId, level, clientY) {
+    if (!(root instanceof HTMLElement) || !sourceId || level == null) return;
+    const source = headingById(root, sourceId);
+    if (!(source instanceof HTMLElement)) return;
+    const placement = reorderInsertionForPointer(root, source, level, clientY);
+    if (!placement) return;
+    const { others, desiredIndex } = placement;
+    const rootRect = root.getBoundingClientRect();
+    let top;
+    if (!others.length) {
+      top = source.getBoundingClientRect().top;
+    } else if (desiredIndex <= 0) {
+      top = others[0].getBoundingClientRect().top;
+    } else if (desiredIndex >= others.length) {
+      top = others[others.length - 1].getBoundingClientRect().bottom;
+    } else {
+      top = others[desiredIndex].getBoundingClientRect().top;
+    }
+    const line = ensureReorderIndicator();
+    line.style.left = `${Math.max(0, rootRect.left + 4)}px`;
+    line.style.width = `${Math.max(24, rootRect.width - 8)}px`;
+    line.style.top = `${Math.round(top - 1)}px`;
+  }
+
+  function stopReorderAutoScroll() {
+    reorderAutoScrollVelocity = 0;
+    if (reorderAutoScrollRaf) cancelAnimationFrame(reorderAutoScrollRaf);
+    reorderAutoScrollRaf = 0;
+  }
+
+  function runReorderAutoScroll() {
+    reorderAutoScrollRaf = 0;
+    if (!triangleDragProxyActive || !reorderAutoScrollVelocity) return;
+    const root = triangleDragProxyRoot;
+    if (!(root instanceof HTMLElement) || !root.isConnected) return;
+    const info = roots.get(root);
+    const scroller = info?.scrollParent || scrollParentFor(root);
+    try {
+      if (!scroller || isWindowScroller(scroller)) {
+        window.scrollBy(0, reorderAutoScrollVelocity);
+      } else {
+        scroller.scrollTop += reorderAutoScrollVelocity;
+      }
+    } catch (_) {}
+    if (triangleDragLastPointer) {
+      updateReorderIndicator(root, triangleDragSourceId, triangleDragSourceLevel, triangleDragLastPointer.y);
+    }
+    reorderAutoScrollRaf = requestAnimationFrame(runReorderAutoScroll);
+  }
+
+  function updateReorderAutoScroll(root, clientY) {
+    const info = roots.get(root);
+    const scroller = info?.scrollParent || scrollParentFor(root);
+    const rect = !scroller || isWindowScroller(scroller)
+      ? { top: 0, bottom: window.innerHeight }
+      : scroller.getBoundingClientRect();
+    const margin = 54;
+    let velocity = 0;
+    if (clientY < rect.top + margin) {
+      const ratio = Math.min(1, Math.max(0, (rect.top + margin - clientY) / margin));
+      velocity = -Math.max(3, Math.round(16 * ratio));
+    } else if (clientY > rect.bottom - margin) {
+      const ratio = Math.min(1, Math.max(0, (clientY - (rect.bottom - margin)) / margin));
+      velocity = Math.max(3, Math.round(16 * ratio));
+    }
+    reorderAutoScrollVelocity = velocity;
+    if (velocity && !reorderAutoScrollRaf) {
+      reorderAutoScrollRaf = requestAnimationFrame(runReorderAutoScroll);
+    } else if (!velocity) {
+      stopReorderAutoScroll();
+    }
+  }
+
+  function maskCollapsedContentInSource(root, sourceId) {
+    if (!(root instanceof HTMLElement) || !sourceId) return;
+    clearDragVisibilityMask(root);
+    const info = ensureRoot(root);
+    const source = info?.entryById?.get(sourceId);
+    if (!source) return;
+    const children = root.children;
+    let hiddenUntil = -1;
+    for (const entry of info.entries) {
+      if (entry.startIndex < source.startIndex || entry.startIndex >= source.endIndexExclusive) continue;
+      if (entry.startIndex < hiddenUntil || !collapsedIds.has(entry.id)) continue;
+      const end = Math.min(entry.endIndexExclusive, source.endIndexExclusive);
+      for (let i = entry.startIndex + 1; i < end; i++) {
+        const child = children[i];
+        if (child instanceof HTMLElement) child.setAttribute(DRAG_HIDDEN_ATTR, '');
+      }
+      hiddenUntil = end;
+    }
+  }
+
+  function dispatchNativeMoveSteps(root, heading, sourceId, delta, onComplete = null) {
+    if (!(root instanceof HTMLElement) || !(heading instanceof HTMLElement) || !delta) {
+      if (typeof onComplete === 'function') onComplete();
+      return;
+    }
+
+    const rect = firstTextRect(heading);
+    const headingRect = heading.getBoundingClientRect();
+    const x = Math.max(headingRect.left + 3, rect.left + 2);
+    const y = rect.top + Math.max(2, rect.height / 2);
+
+    // Select the heading once, then use CardMirror's own schema-aware Move
+    // Container Up/Down key path. This is deliberately NOT the page-drag
+    // controller: no synthetic pointer drag or hidden modifier state exists.
+    const mouseInit = {
+      bubbles: true,
+      cancelable: true,
+      clientX: x,
+      clientY: y,
+      button: 0,
+      buttons: 1,
+    };
+    heading.dispatchEvent(new MouseEvent('mousedown', mouseInit));
+    heading.dispatchEvent(new MouseEvent('mouseup', { ...mouseInit, buttons: 0 }));
+    heading.dispatchEvent(new MouseEvent('click', { ...mouseInit, buttons: 0 }));
+    restoreViewportSnapshot();
+
+    const mac = isMacPlatform();
+    const key = delta > 0 ? 'ArrowDown' : 'ArrowUp';
+    const steps = Math.min(250, Math.abs(delta));
+    const init = {
+      bubbles: true,
+      cancelable: true,
+      key,
+      code: key,
+      altKey: true,
+      ctrlKey: !mac,
+      metaKey: mac,
+    };
+
+    // ProseMirror transactions are synchronous. Keep the sequence in one task
+    // so the browser never paints intermediate section positions. CardMirror's
+    // current structural move command is sibling-based and effectively instant
+    // even on large tournament files, so this is cheaper than a pointer-drag
+    // controller continuously recalculating drop geometry.
+    for (let i = 0; i < steps; i++) {
+      root.dispatchEvent(new KeyboardEvent('keydown', init));
+      root.dispatchEvent(new KeyboardEvent('keyup', init));
+    }
+    restoreViewportSnapshot();
+    queueMicrotask(() => {
+      restoreViewportSnapshot();
+      if (typeof onComplete === 'function') onComplete();
+    });
+  }
+
+  function finalizeTriangleDragSettling(root) {
+    stopReorderAutoScroll();
+    clearReorderIndicator();
+    if (!(root instanceof HTMLElement) || !root.isConnected) {
+      if (root instanceof HTMLElement) clearDragVisibilityMask(root);
+      triangleDragSettlingRoot = null;
+      triangleDragViewportSnapshot = null;
+      return;
+    }
+    const info = roots.get(root);
+    if (info) {
+      info.structureDirty = true;
+      syncRootHeadings(root);
+    } else {
+      queueCollapseCss(root);
+    }
+
+    // Restore the viewport while CardMirror/ProseMirror finish measuring the
+    // structural edit. Remove the temporary mask only after collapse CSS for
+    // the new order has already been rebuilt.
+    requestAnimationFrame(() => {
+      restoreViewportSnapshot();
+      requestAnimationFrame(() => {
+        restoreViewportSnapshot();
+        clearDragVisibilityMask(root);
+        triangleDragSettlingRoot = null;
+        triangleDragViewportSnapshot = null;
+        queueLayout(root);
+      });
+    });
+  }
+
+  function startTriangleDragProxy(heading, btn, event) {
+    const root = heading.parentElement;
+    if (!(root instanceof HTMLElement) || !root.classList.contains('ProseMirror')) return false;
+    const id = headingId(heading);
+    const level = headingLevel(heading);
+    if (!id || level == null) return false;
+
+    triangleDragProxyActive = true;
+    triangleDragProxyRoot = root;
+    triangleDragSourceId = id;
+    triangleDragSourceLevel = level;
+    triangleDragLastPointer = { x: event.clientX, y: event.clientY };
+    triangleDragCancelled = false;
+    triangleDragPhysicalButtonMask = pendingTriangleRightDrag?.buttonMask || 2;
+    triangleDragSuppressContextUntil = performance.now() + 1000;
+    btn.classList.add('cm-ch-dragging');
+    updateReorderIndicator(root, id, level, event.clientY);
+    updateReorderAutoScroll(root, event.clientY);
+    rememberEditorContext();
+    return true;
+  }
+
+  function dispatchProxiedDragMove(event) {
+    if (!(event instanceof PointerEvent) || proxiedDragEvents.has(event)) return;
+
+    if (!triangleDragProxyActive && pendingTriangleRightDrag) {
+      const pending = pendingTriangleRightDrag;
+      if (pending.pointerId && event.pointerId && pending.pointerId !== event.pointerId) return;
+      if (pending.buttonMask && !(event.buttons & pending.buttonMask)) {
+        pendingTriangleRightDrag = null;
+        return;
+      }
+      const dx = event.clientX - pending.startX;
+      const dy = event.clientY - pending.startY;
+      if ((dx * dx) + (dy * dy) < RIGHT_DRAG_THRESHOLD_PX * RIGHT_DRAG_THRESHOLD_PX) return;
+
+      pendingTriangleRightDrag = null;
+      if (!pending.heading?.isConnected || !pending.btn?.isConnected) return;
+      if (!startTriangleDragProxy(pending.heading, pending.btn, event)) return;
+    }
+
+    if (!triangleDragProxyActive) return;
+    if (triangleDragPhysicalButtonMask && !(event.buttons & triangleDragPhysicalButtonMask)) {
+      finishTriangleDragProxy(false);
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    triangleDragLastPointer = { x: event.clientX, y: event.clientY };
+    updateReorderIndicator(
+      triangleDragProxyRoot,
+      triangleDragSourceId,
+      triangleDragSourceLevel,
+      event.clientY,
+    );
+    updateReorderAutoScroll(triangleDragProxyRoot, event.clientY);
+  }
+
+  function finishTriangleDragProxy(cancelled = false) {
+    if (!triangleDragProxyActive) return;
+
+    const root = triangleDragProxyRoot;
+    const sourceId = triangleDragSourceId;
+    const sourceLevel = triangleDragSourceLevel;
+    const pointer = triangleDragLastPointer;
+
+    pendingTriangleRightDrag = null;
+    triangleDragProxyActive = false;
+    triangleDragProxyRoot = null;
+    triangleDragSourceId = '';
+    triangleDragSourceLevel = null;
+    triangleDragLastPointer = null;
+    triangleDragCancelled = false;
+    triangleDragPhysicalButtonMask = 0;
+    stopReorderAutoScroll();
+    clearReorderIndicator();
+    for (const btn of buttons.values()) btn.classList.remove('cm-ch-dragging');
+
+    if (cancelled || !(root instanceof HTMLElement) || !root.isConnected || !sourceId || sourceLevel == null || !pointer) {
+      triangleDragSuppressContextUntil = performance.now() + 250;
+      return;
+    }
+
+    const source = headingById(root, sourceId);
+    if (!(source instanceof HTMLElement)) return;
+    const placement = reorderInsertionForPointer(root, source, sourceLevel, pointer.y);
+    if (!placement) return;
+    const delta = placement.desiredIndex - placement.sourceIndex;
+    triangleDragSuppressContextUntil = performance.now() + 350;
+    if (!delta) return;
+
+    triangleDragViewportSnapshot = captureViewportSnapshot(root);
+    triangleDragSettlingRoot = root;
+    maskCollapsedContentInSource(root, sourceId);
+    dispatchNativeMoveSteps(root, source, sourceId, delta, () => finalizeTriangleDragSettling(root));
+  }
+
+  function onTriangleDragPointerUp(event) {
+    if (!(event instanceof PointerEvent) || proxiedDragEvents.has(event)) return;
+
+    if (!triangleDragProxyActive && pendingTriangleRightDrag) {
+      const pending = pendingTriangleRightDrag;
+      if (!pending.pointerId || !event.pointerId || pending.pointerId === event.pointerId) {
+        pendingTriangleRightDrag = null;
+        triangleDragSuppressContextUntil = performance.now() + 250;
+      }
+      return;
+    }
+    if (!triangleDragProxyActive) return;
+    event.preventDefault();
+    event.stopPropagation();
+    triangleDragLastPointer = { x: event.clientX, y: event.clientY };
+    finishTriangleDragProxy(false);
+  }
+
+  function onTriangleDragPointerCancel() {
+    pendingTriangleRightDrag = null;
+    finishTriangleDragProxy(true);
+  }
+
+  function onTriangleDragAbort() {
+    pendingTriangleRightDrag = null;
+    finishTriangleDragProxy(true);
+  }
+
+  function onTriangleContextMenu(event) {
+    const target = event.target;
+    if (pendingTriangleRightDrag ||
+        triangleDragProxyActive ||
+        performance.now() < triangleDragSuppressContextUntil ||
+        (target instanceof Element && target.closest('.cm-collapse-toggle'))) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  }
+
   function createButton(heading) {
     const btn = document.createElement('button');
     btn.type = 'button';
@@ -504,9 +1273,30 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
     btn.tabIndex = -1;
 
     btn.addEventListener('pointerdown', event => {
+      const macSecondary = isMacPlatform() && event.button === 0 && event.ctrlKey;
+      const rightButton = event.button === 2 || macSecondary;
+
+      if (rightButton) {
+        // Right-click only arms our own lightweight reorder gesture. It never
+        // enters CardMirror's native page-drag mode, so an ordinary secondary
+        // click cannot strand or freeze the editor.
+        event.preventDefault();
+        event.stopPropagation();
+        pendingTriangleRightDrag = {
+          heading,
+          btn,
+          pointerId: event.pointerId || 0,
+          buttonMask: macSecondary ? 1 : 2,
+          startX: event.clientX,
+          startY: event.clientY,
+        };
+        triangleDragSuppressContextUntil = performance.now() + 1000;
+        return;
+      }
+
+      if (event.button !== 0) return;
       event.preventDefault();
       event.stopPropagation();
-
       const id = headingId(heading);
       if (!id) return;
 
@@ -517,9 +1307,12 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
         collapsedIds.add(id);
       }
 
-      queueCollapseCss();
-      updateVisibleButtonStates();
-      queueLayout();
+      commitCollapseState(heading.parentElement);
+    });
+
+    btn.addEventListener('contextmenu', event => {
+      event.preventDefault();
+      event.stopPropagation();
     });
 
     return btn;
@@ -543,16 +1336,16 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
 
   function updateButtonState(heading, btn = buttons.get(heading)) {
     if (!(btn instanceof HTMLButtonElement)) return;
-    applyButtonAppearance(heading, btn);
     const id = headingId(heading);
     const collapsed = !!id && collapsedIds.has(id);
     btn.textContent = collapsed ? '▶' : '▼';
-    btn.title = collapsed ? 'Expand section' : 'Collapse section';
+    btn.title = (collapsed ? 'Expand section' : 'Collapse section') + ' · Right-drag to reorder';
     btn.setAttribute('aria-label', btn.title);
   }
 
-  function updateVisibleButtonStates() {
+  function updateVisibleButtonStates(root = null) {
     for (const heading of visibleHeadings) {
+      if (root instanceof HTMLElement && heading.parentElement !== root) continue;
       updateButtonState(heading);
     }
   }
@@ -571,40 +1364,26 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
     );
   }
 
-  function buildRulesForRoot(info, rules) {
-    const children = Array.from(info.root.children)
-      .filter(el => el instanceof HTMLElement);
+  function buildRulesForRoot(info) {
+    const rules = [];
+    let hiddenUntil = -1;
 
-    let active = null;
-
-    for (let i = 0; i < children.length; i++) {
-      const child = children[i];
-      const level = headingLevel(child);
-
-      if (active) {
-        // The first same-or-higher heading ends the currently collapsed section.
-        if (level != null && level <= active.level) {
-          emitCollapsedRule(rules, info, active.startIndex, i);
-          active = null;
-          // Process this boundary heading below; it may itself be collapsed.
-        } else {
-          // Everything inside an already-collapsed section is hidden. Nested
-          // collapsed rules are redundant until the ancestor expands.
-          continue;
-        }
-      }
-
-      if (level != null) {
-        const id = headingId(child);
-        if (id && collapsedIds.has(id)) {
-          active = { level, startIndex: i };
-        }
-      }
+    // `entries` is rebuilt only when ProseMirror's top-level structure changes.
+    // Command spam therefore scales with heading count, not every card/body
+    // paragraph in a giant backfile.
+    for (const entry of info.entries) {
+      if (entry.startIndex < hiddenUntil) continue;
+      if (!collapsedIds.has(entry.id)) continue;
+      emitCollapsedRule(
+        rules,
+        info,
+        entry.startIndex,
+        entry.endIndexExclusive
+      );
+      hiddenUntil = entry.endIndexExclusive;
     }
 
-    if (active) {
-      emitCollapsedRule(rules, info, active.startIndex, children.length);
-    }
+    info.collapseRulesText = rules.join('\n');
   }
 
   function rebuildCollapseCss() {
@@ -613,22 +1392,39 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
     ensureStyles();
     discoverRoots();
 
-    const rules = [];
+    const updateAll = collapseAllRequested;
+    const targets = updateAll ? null : new Set(pendingCollapseRoots);
+    collapseAllRequested = false;
+    pendingCollapseRoots.clear();
+
     for (const info of roots.values()) {
       if (!info.root.isConnected) continue;
-      buildRulesForRoot(info, rules);
+      if (!targets || targets.has(info.root)) buildRulesForRoot(info);
     }
-    collapseStyle.textContent = rules.join('\n');
 
-    // CSS visibility changed. Reposition only the small set of currently
-    // materialized buttons; IntersectionObserver removes newly hidden ones.
+    collapseStyle.textContent = Array.from(roots.values())
+      .filter(info => info.root.isConnected && info.collapseRulesText)
+      .map(info => info.collapseRulesText)
+      .join('\n');
+
+    // CSS visibility changed. Restrict state/geometry work to the pane(s)
+    // whose collapse state changed whenever possible.
     requestAnimationFrame(() => {
-      updateVisibleButtonStates();
-      queueLayout();
+      if (!targets) {
+        queueLayout();
+      } else {
+        for (const root of targets) queueLayout(root);
+      }
     });
   }
 
-  function queueCollapseCss() {
+  function queueCollapseCss(root = null) {
+    if (root instanceof HTMLElement) {
+      if (!collapseAllRequested) pendingCollapseRoots.add(root);
+    } else {
+      collapseAllRequested = true;
+      pendingCollapseRoots.clear();
+    }
     if (cssQueued) return;
     cssQueued = true;
     requestAnimationFrame(rebuildCollapseCss);
@@ -639,10 +1435,13 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
     let node = walker.nextNode();
 
     while (node) {
-      if ((node.nodeValue || '').trim()) {
+      const value = node.nodeValue || '';
+      const firstVisible = value.search(/\S/);
+      if (firstVisible >= 0) {
         try {
           const range = document.createRange();
-          range.selectNodeContents(node);
+          range.setStart(node, firstVisible);
+          range.setEnd(node, Math.min(value.length, firstVisible + 1));
           const rects = Array.from(range.getClientRects())
             .filter(r => r.width > 0 && r.height > 0);
           range.detach?.();
@@ -667,14 +1466,13 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
     const info = root instanceof HTMLElement ? roots.get(root) : null;
     if (!info || !heading.isConnected || !btn.isConnected) return;
 
-    const headingStyle = getComputedStyle(heading);
     const headingRect = heading.getBoundingClientRect();
 
     if (
-      headingStyle.display === 'none' ||
-      headingStyle.visibility === 'hidden' ||
       headingRect.width <= 0 ||
-      headingRect.height <= 0
+      headingRect.height <= 0 ||
+      (typeof heading.checkVisibility === 'function' &&
+       !heading.checkVisibility({ checkVisibilityCSS: true }))
     ) {
       btn.style.display = 'none';
       return;
@@ -702,14 +1500,10 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
     btn.style.left = `${Math.round(left)}px`;
     btn.style.top = `${Math.round(top)}px`;
 
-    // Size/manual-color appearance is updated only when settings/state change.
-    // Automatic color still follows CardMirror theme/heading color, but reuse
-    // the computed style we already needed for visibility instead of forcing a
-    // second style read/write on every geometry pass.
-    if (appearance.color === 'Automatic' &&
-        btn.style.color !== headingStyle.color) {
-      btn.style.color = headingStyle.color;
-    }
+    // Appearance is updated at button creation, on plugin setting changes,
+    // visible-heading style mutations, and host theme changes. Scroll/layout
+    // passes therefore stay geometry-only and avoid a computed-style read for
+    // every visible heading.
   }
 
   function layoutVisibleButtons() {
@@ -728,6 +1522,16 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
   }
 
   function queueLayout(root = null) {
+    // During a native section drag CardMirror owns all visual feedback. Avoid
+    // competing geometry reads/writes while it auto-scrolls and calculates
+    // drop slots; one consolidated layout runs when the gesture finishes.
+    if ((triangleDragProxyActive &&
+         (root == null || root === triangleDragProxyRoot)) ||
+        (triangleDragSettlingRoot &&
+         (root == null || root === triangleDragSettlingRoot))) {
+      return;
+    }
+
     if (root instanceof HTMLElement) {
       if (!layoutAllRequested) pendingLayoutRoots.add(root);
     } else {
@@ -776,11 +1580,13 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
     pendingStructureRoots.clear();
 
     for (const root of targets) {
-      if (root.isConnected) syncRootHeadings(root);
+      const info = roots.get(root);
+      if (root.isConnected && info?.structureDirty) syncRootHeadings(root);
     }
 
-    queueCollapseCss();
-    queueLayout();
+    for (const root of targets) {
+      if (root.isConnected) queueLayout(root);
+    }
   }
 
   function queueStructureRefresh(root) {
@@ -834,27 +1640,25 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
       return null;
     }
 
-    const children = Array.from(root.children);
-    let index = children.indexOf(child);
-    if (index < 0) return null;
+    const info = ensureRoot(root);
+    const cached = info?.ownerHeadingByChild?.get(child);
+    if (cached instanceof HTMLElement && cached.isConnected) return cached;
 
-    for (let i = index; i >= 0; i--) {
-      const candidate = children[i];
-      if (candidate instanceof HTMLElement && headingLevel(candidate) != null) {
-        return candidate;
-      }
+    // Fallback for the narrow interval between a ProseMirror DOM mutation and
+    // the next structure-index refresh. This should be rare; the normal path
+    // above is O(1).
+    let candidate = child;
+    while (candidate && candidate.parentElement === root) {
+      if (headingLevel(candidate) != null) return candidate;
+      candidate = candidate.previousElementSibling;
     }
     return null;
   }
 
   function headingById(root, id) {
     if (!(root instanceof HTMLElement) || !id) return null;
-    for (const heading of root.querySelectorAll(HEADING_SELECTOR)) {
-      if (heading instanceof HTMLElement && headingId(heading) === id) {
-        return heading;
-      }
-    }
-    return null;
+    const info = ensureRoot(root);
+    return info?.entryById?.get(id)?.heading || null;
   }
 
   function liveEditorContext() {
@@ -922,6 +1726,12 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
     if (!(root instanceof HTMLElement) || !(child instanceof HTMLElement)) {
       return [];
     }
+
+    // Navigation to already-visible content should be nearly free. This also
+    // avoids touching the structural index when the nav pane jumps to a normal
+    // expanded section on a giant document. Hidden descendants have no client
+    // rects because collapse uses display:none.
+    if (!cssQueued && child.getClientRects().length > 0) return [];
 
     const nearest = containingHeadingForChild(root, child);
     if (!(nearest instanceof HTMLElement)) return [];
@@ -992,7 +1802,7 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
       }
     }
 
-    queueLayout();
+    queueLayout(root);
   }
 
   function runAutoReveal() {
@@ -1025,7 +1835,7 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
     // Rebuild the hiding CSS first. CardMirror may already have attempted its
     // own scroll while the destination was display:none, so after two frames
     // make one conservative visibility check and only scroll if still needed.
-    commitCollapseState();
+    commitCollapseState(root);
     requestAnimationFrame(() => {
       requestAnimationFrame(() => scrollRevealedTargetIntoView(target));
     });
@@ -1044,34 +1854,38 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
     requestAnimationFrame(runAutoReveal);
   }
 
-  function commitCollapseState() {
-    queueCollapseCss();
-    updateVisibleButtonStates();
-    queueLayout();
+  function commitCollapseState(root = null) {
+    queueCollapseCss(root);
+    // Arrow state can update immediately; geometry must wait until the new
+    // collapse CSS has actually landed, which rebuildCollapseCss schedules.
+    // Avoiding an extra pre-CSS layout pass matters when commands are spammed.
+    if (root instanceof HTMLElement) updateVisibleButtonStates(root);
+    else updateVisibleButtonStates();
+  }
+
+  function rootInfo(root) {
+    if (!(root instanceof HTMLElement)) return null;
+    return ensureRoot(root);
   }
 
   function setAllInRoot(root, collapsed) {
-    if (!(root instanceof HTMLElement)) return false;
-    ensureRoot(root);
+    const info = rootInfo(root);
+    if (!info) return false;
     if (collapsed) suppressRevealForCurrentSelection();
 
     let changed = false;
-    // One linear scan. Do not rebuild layout/CSS once per heading.
-    for (const heading of root.querySelectorAll(HEADING_SELECTOR)) {
-      if (!(heading instanceof HTMLElement)) continue;
-      const id = headingId(heading);
-      if (!id) continue;
+    for (const entry of info.entries) {
       if (collapsed) {
-        if (!collapsedIds.has(id)) {
-          collapsedIds.add(id);
+        if (!collapsedIds.has(entry.id)) {
+          collapsedIds.add(entry.id);
           changed = true;
         }
-      } else if (collapsedIds.delete(id)) {
+      } else if (collapsedIds.delete(entry.id)) {
         changed = true;
       }
     }
 
-    if (changed) commitCollapseState();
+    if (changed) commitCollapseState(root);
     return changed;
   }
 
@@ -1081,34 +1895,31 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
 
   function setLevelInFocusedRoot(level, collapsed) {
     const root = commandRoot();
-    if (!(root instanceof HTMLElement)) return false;
-    ensureRoot(root);
+    const info = rootInfo(root);
+    if (!info) return false;
     if (collapsed) suppressRevealForCurrentSelection();
 
     let changed = false;
-    for (const heading of root.querySelectorAll(HEADING_SELECTOR)) {
-      if (!(heading instanceof HTMLElement) || headingLevel(heading) !== level) {
-        continue;
-      }
-      const id = headingId(heading);
-      if (!id) continue;
+    for (const entry of info.entries) {
+      if (entry.level !== level) continue;
       if (collapsed) {
-        if (!collapsedIds.has(id)) {
-          collapsedIds.add(id);
+        if (!collapsedIds.has(entry.id)) {
+          collapsedIds.add(entry.id);
           changed = true;
         }
-      } else if (collapsedIds.delete(id)) {
+      } else if (collapsedIds.delete(entry.id)) {
         changed = true;
       }
     }
 
-    if (changed) commitCollapseState();
+    if (changed) commitCollapseState(root);
     return changed;
   }
 
   function toggleCurrentSection(api) {
     const heading = currentSectionHeading();
-    if (!(heading instanceof HTMLElement)) {
+    const root = heading?.parentElement;
+    if (!(heading instanceof HTMLElement) || !(root instanceof HTMLElement)) {
       api?.showToast?.('Collapsible Headers: place the cursor inside a Pocket, Hat, or Block first.');
       return;
     }
@@ -1121,67 +1932,86 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
       suppressRevealForCurrentSelection();
       collapsedIds.add(id);
     }
-    commitCollapseState();
+    commitCollapseState(root);
   }
 
   function sectionPath(root, heading) {
-    if (!(root instanceof HTMLElement) || !(heading instanceof HTMLElement)) {
-      return [];
-    }
-
-    const children = Array.from(root.children);
-    const index = children.indexOf(heading);
-    const level = headingLevel(heading);
-    if (index < 0 || level == null) return [];
-
-    const path = [heading];
-    let ceiling = level;
-    for (let i = index - 1; i >= 0 && ceiling > 1; i--) {
-      const candidate = children[i];
-      if (!(candidate instanceof HTMLElement)) continue;
-      const candidateLevel = headingLevel(candidate);
-      if (candidateLevel != null && candidateLevel < ceiling) {
-        path.push(candidate);
-        ceiling = candidateLevel;
-      }
-    }
-
-    return path.reverse();
+    const info = rootInfo(root);
+    if (!info || !(heading instanceof HTMLElement)) return [];
+    const entry = info.entryByHeading.get(heading);
+    if (!entry) return [];
+    return [...(entry.ancestorHeadings || []), heading];
   }
 
-  function parentScopeBounds(children, headingIndex, level) {
-    let start = -1;
-    let end = children.length;
+  function entryScopeBounds(info, heading) {
+    const entry = info.entryByHeading.get(heading);
+    const index = info.entryIndexByHeading.get(heading);
+    if (!entry || index == null) return null;
 
-    for (let i = headingIndex - 1; i >= 0; i--) {
-      const el = children[i];
-      if (!(el instanceof HTMLElement)) continue;
-      const candidateLevel = headingLevel(el);
-      if (candidateLevel != null && candidateLevel < level) {
+    let start = -1;
+    let end = info.entries.length;
+    for (let i = index - 1; i >= 0; i--) {
+      if (info.entries[i].level < entry.level) {
         start = i;
         break;
       }
     }
-
-    for (let i = headingIndex + 1; i < children.length; i++) {
-      const el = children[i];
-      if (!(el instanceof HTMLElement)) continue;
-      const candidateLevel = headingLevel(el);
-      if (candidateLevel != null && candidateLevel < level) {
+    for (let i = index + 1; i < info.entries.length; i++) {
+      if (info.entries[i].level < entry.level) {
         end = i;
         break;
       }
     }
+    return { start, end, index, entry };
+  }
 
-    return { start, end };
+  function toggleAllUnderCurrentSection(api) {
+    const heading = currentSectionHeading();
+    const root = heading?.parentElement;
+    const info = rootInfo(root);
+    if (!(heading instanceof HTMLElement) || !(root instanceof HTMLElement) || !info) {
+      api?.showToast?.('Collapsible Headers: place the cursor inside a Pocket, Hat, or Block first.');
+      return;
+    }
+
+    const current = info.entryByHeading.get(heading);
+    if (!current) return;
+    const descendants = info.entries.filter(entry =>
+      entry.startIndex > current.startIndex &&
+      entry.startIndex < current.endIndexExclusive &&
+      entry.level > current.level
+    );
+
+    if (!descendants.length) {
+      const name = current.level === 1 ? 'Pocket' : current.level === 2 ? 'Hat' : 'Block';
+      api?.showToast?.(`Collapsible Headers: current ${name} has no headers underneath.`);
+      return;
+    }
+
+    // If anything underneath is open, collapse the whole descendant tree. If
+    // everything is already collapsed, the same command expands it all. The
+    // current heading's own state is intentionally left untouched.
+    const collapse = descendants.some(entry => !collapsedIds.has(entry.id));
+    if (collapse) suppressRevealForCurrentSelection();
+    for (const entry of descendants) {
+      if (collapse) collapsedIds.add(entry.id);
+      else collapsedIds.delete(entry.id);
+    }
+    commitCollapseState(root);
+
+    const name = current.level === 1 ? 'Pocket' : current.level === 2 ? 'Hat' : 'Block';
+    api?.showToast?.(
+      `Collapsible Headers: ${collapse ? 'collapsed' : 'expanded'} all headers under current ${name}.`
+    );
   }
 
   function focusCurrentSection(api) {
     const heading = currentSectionHeading();
     const root = heading?.parentElement;
+    const info = rootInfo(root);
     if (!(heading instanceof HTMLElement) ||
         !(root instanceof HTMLElement) ||
-        !root.classList.contains('ProseMirror')) {
+        !info) {
       api?.showToast?.('Collapsible Headers: place the cursor inside a Pocket, Hat, or Block first.');
       return;
     }
@@ -1189,33 +2019,28 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
     const path = sectionPath(root, heading);
     if (!path.length) return;
     suppressRevealForCurrentSelection();
-    const children = Array.from(root.children);
     let changed = false;
 
     // Focus the whole branch: at each level, expand the path heading and
-    // collapse its same-level siblings inside the same parent scope.
+    // collapse its same-level siblings inside the same parent scope. Work only
+    // over the cached heading index, never every top-level card/body node.
     for (const pathHeading of path) {
-      const id = headingId(pathHeading);
-      const level = headingLevel(pathHeading);
-      const index = children.indexOf(pathHeading);
-      if (!id || level == null || index < 0) continue;
+      const bounds = entryScopeBounds(info, pathHeading);
+      if (!bounds) continue;
+      const { entry, start, end } = bounds;
 
-      if (collapsedIds.delete(id)) changed = true;
-      const bounds = parentScopeBounds(children, index, level);
-
-      for (let i = bounds.start + 1; i < bounds.end; i++) {
-        const sibling = children[i];
-        if (!(sibling instanceof HTMLElement) || sibling === pathHeading) continue;
-        if (headingLevel(sibling) !== level) continue;
-        const siblingId = headingId(sibling);
-        if (siblingId && !collapsedIds.has(siblingId)) {
-          collapsedIds.add(siblingId);
+      if (collapsedIds.delete(entry.id)) changed = true;
+      for (let i = start + 1; i < end; i++) {
+        const sibling = info.entries[i];
+        if (sibling.heading === pathHeading || sibling.level !== entry.level) continue;
+        if (!collapsedIds.has(sibling.id)) {
+          collapsedIds.add(sibling.id);
           changed = true;
         }
       }
     }
 
-    if (changed) commitCollapseState();
+    if (changed) commitCollapseState(root);
     const currentLevel = headingLevel(heading);
     const name = currentLevel === 1 ? 'Pocket' : currentLevel === 2 ? 'Hat' : 'Block';
     api?.showToast?.(`Collapsible Headers: focused current ${name}.`);
@@ -1495,6 +2320,16 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
         },
       },
       {
+        id: PLUGIN_ID + '.toggle-all-under-current',
+        label: 'Collapsible Headers: Toggle All Under Current Section',
+        keywords: ['toggle', 'collapse', 'expand', 'all', 'under', 'current', 'section', 'descendants'],
+        defaultKey: null,
+        run: api => {
+          bindPluginApi(api);
+          toggleAllUnderCurrentSection(api);
+        },
+      },
+      {
         id: PLUGIN_ID + '.focus-current',
         label: 'Collapsible Headers: Focus Current Section',
         keywords: ['focus', 'current', 'section', 'siblings', 'outline'],
@@ -1517,10 +2352,9 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
       {
         key: 'triangleSize',
         label: 'Triangle size',
-        type: 'select',
-        default: 'Medium',
-        options: SIZE_OPTIONS,
-        description: 'Changes the visible triangle and its click target.',
+        type: 'number',
+        default: TRIANGLE_SIZE_DEFAULT,
+        description: `Use ▼ / ▲ to adjust the triangle size (${TRIANGLE_SIZE_MIN}–${TRIANGLE_SIZE_MAX}).`,
       },
     ],
   };
@@ -1541,22 +2375,37 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
 
     document.removeEventListener('input', onEditorInput, true);
     document.removeEventListener('change', onPotentialSettingsChange, true);
+    document.removeEventListener('click', queueEnhanceTriangleSizeSetting, true);
     document.removeEventListener('focusin', onFocusIn, true);
     document.removeEventListener('selectionchange', onSelectionChange, true);
     document.removeEventListener('input', onHostNavigationInput, true);
     document.removeEventListener('keydown', onHostNavigationKeyDown, true);
     document.removeEventListener('click', onHostNavigationClick, true);
+    document.removeEventListener('pointermove', dispatchProxiedDragMove, true);
+    document.removeEventListener('pointerup', onTriangleDragPointerUp, true);
+    document.removeEventListener('pointercancel', onTriangleDragPointerCancel, true);
+    document.removeEventListener('contextmenu', onTriangleContextMenu, true);
+    window.removeEventListener('blur', onTriangleDragAbort);
     window.removeEventListener('resize', queueLayout);
+    try { themeObserver?.disconnect(); } catch (_) {}
+    themeObserver = null;
 
     for (const timer of startupTimers) clearTimeout(timer);
     startupTimers.length = 0;
 
     for (const [root, info] of roots) {
+      clearDragVisibilityMask(root);
       try { info.intersection?.disconnect(); } catch (_) {}
       try { info.mutations?.disconnect(); } catch (_) {}
+      for (const observer of info.headingMutationObservers?.values?.() || []) {
+        try { observer.disconnect(); } catch (_) {}
+      }
+      info.headingMutationObservers?.clear?.();
       try { info.resize?.disconnect(); } catch (_) {}
       try { info.layer?.remove(); } catch (_) {}
     }
+
+    if (triangleDragProxyRoot instanceof HTMLElement) clearDragVisibilityMask(triangleDragProxyRoot);
 
     roots.clear();
     buttons.clear();
@@ -1564,6 +2413,8 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
     pendingStructureRoots.clear();
     pendingPostEditRoots.clear();
     pendingLayoutRoots.clear();
+    pendingCollapseRoots.clear();
+    collapseAllRequested = false;
     layoutAllRequested = false;
     lastEditorContext = null;
     lastEditorSelectionTarget = null;
@@ -1573,30 +2424,52 @@ const STYLE_ID = 'cardmirror-collapsible-headers-style';
     hostNavigationProbeQueued = false;
     pendingHostNavigationSelector = '';
     pendingHostNavigationRoot = null;
+    stopReorderAutoScroll();
+    clearReorderIndicator();
+    pendingTriangleRightDrag = null;
+    triangleDragProxyActive = false;
+    triangleDragProxyRoot = null;
+    triangleDragSourceId = '';
+    triangleDragSourceLevel = null;
+    triangleDragLastPointer = null;
+    triangleDragCancelled = false;
+    triangleDragPhysicalButtonMask = 0;
+    triangleDragSuppressContextUntil = 0;
+    triangleDragSettlingRoot = null;
+    triangleDragViewportSnapshot = null;
+    dragMaskRefreshQueued = false;
 
     try { document.getElementById(STYLE_ID)?.remove(); } catch (_) {}
     try { document.getElementById(COLLAPSE_STYLE_ID)?.remove(); } catch (_) {}
   }
 
   ensureStyles();
+  ensureThemeObserver();
   const initialAppearance = readBootstrapAppearance();
   appearance = initialAppearance;
   discoverRoots();
   queueCollapseCss();
   queueLayout();
+  queueEnhanceTriangleSizeSetting();
 
   document.addEventListener('input', onEditorInput, true);
   document.addEventListener('change', onPotentialSettingsChange, true);
+  document.addEventListener('click', queueEnhanceTriangleSizeSetting, true);
   document.addEventListener('focusin', onFocusIn, true);
   document.addEventListener('selectionchange', onSelectionChange, true);
   document.addEventListener('input', onHostNavigationInput, true);
   document.addEventListener('keydown', onHostNavigationKeyDown, true);
   document.addEventListener('click', onHostNavigationClick, true);
+  document.addEventListener('pointermove', dispatchProxiedDragMove, true);
+  document.addEventListener('pointerup', onTriangleDragPointerUp, true);
+  document.addEventListener('pointercancel', onTriangleDragPointerCancel, true);
+  document.addEventListener('contextmenu', onTriangleContextMenu, true);
+  window.addEventListener('blur', onTriangleDragAbort);
   window.addEventListener('resize', queueLayout, { passive: true });
 
   window[RUNTIME_KEY] = {
     destroy: destroyRuntime,
-    version: '1.0.0-beta.6',
+    version: '1.0.0-beta.11',
   };
 
   // Bounded startup discovery only. There is no permanent document-wide poll.
