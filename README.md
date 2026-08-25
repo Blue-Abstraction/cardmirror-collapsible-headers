@@ -13,5 +13,8 @@ Email me at `blueabstractionoop@gmail.com` for any comments, issues, or more fea
 
 ## Current Features
 - Clicking the dropdowns to the left of Pocket, Hat, and Block styles collapse its contents and can be pressed again to expand.
-- Commands to collapse/expand certain headers or the entire document, as well as a command to focus the current selection by collapsing everything else are available in CardMirror's Smart Search feature.
+- Multiple commands added to CardMirror's Smart Search feature:
+  - Collapse/expand certain headers, the entire document, or only the contents under a selected header.
+  - Focus on the current selection by collapsing everything else.
+- Holding and dragging right-click on dropdown triangles to move headers within the document (no longer just available in the navigation pane!)
 - Customizable dropdown in `Settings`: different colors and sizes!
